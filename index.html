@@ -259,6 +259,13 @@
 </div>
 
 <script>
+    // --- CONSTANTS ---
+    const CAPS = ["400", "300", "250", "200", "150", "650"];
+    const STATUS_STATES = ['Waiting', 'Under Process', 'Loaded'];
+    const MASTER_DRIVERS_KEY = 'h_master_drivers';
+    let editDriverIndex = -1;
+    let autoSaveTimer = null;
+
     // --- DIST DATA & KM DATA ---
     const distData = [
         { d: "AALISHA MARKETING", c: "JUNAGADH", k: 295 }, { d: "AALISHA MARKETING", c: "PORBANDAR", k: 330 },
@@ -303,87 +310,410 @@
         "BAVLA": 0, "SANAND": 20, "VIRAMGAM": 60, "CHANGODAR": 15, "ASLALI": 30
     };
 
+    // --- STORAGE HELPERS (date-based daily save/load) ---
+    function getPlanDate() {
+        const el = document.getElementById('planDate');
+        if (!el.value) el.valueAsDate = new Date();
+        return el.value;
+    }
+
+    function getStorageKey(type) {
+        return `h_v3_${type}_${getPlanDate()}`;
+    }
+
+    function safeParse(key, fallback) {
+        try {
+            const raw = localStorage.getItem(key);
+            if (raw === null || raw === '') return fallback;
+            const parsed = JSON.parse(raw);
+            return parsed == null ? fallback : parsed;
+        } catch (e) {
+            console.warn('LocalStorage parse failed:', key, e);
+            return fallback;
+        }
+    }
+
+    function safeSetItem(key, value) {
+        try {
+            localStorage.setItem(key, JSON.stringify(value));
+            scheduleDailyAutoSave();
+            return true;
+        } catch (e) {
+            alert('Storage unavailable or full. Export data and clear old records.');
+            return false;
+        }
+    }
+
+    function emptyQueueRow() {
+        return { "400": "", "300": "", "250": "", "200": "", "150": "", "650": "" };
+    }
+
+    function normalizeVehicle(v) {
+        return String(v || '').toUpperCase().trim().replace(/\s+/g, ' ');
+    }
+
+    function normalizeStatus(status) {
+        const key = String(status || 'waiting').toLowerCase().trim();
+        if (key === 'under process' || key === 'underprocess') return 'Under Process';
+        if (key === 'loaded' || key === 'done') return 'Loaded';
+        return 'Waiting';
+    }
+
+    function normalizeQueueData(data) {
+        if (!Array.isArray(data)) return [];
+        return data.map(row => {
+            const n = emptyQueueRow();
+            CAPS.forEach(cap => {
+                if (row && row[cap]) n[cap] = normalizeVehicle(row[cap]);
+            });
+            return n;
+        });
+    }
+
+    function compactQueue(data) {
+        return normalizeQueueData(data).filter(row => CAPS.some(cap => row[cap]));
+    }
+
+    function getQueueData() {
+        return compactQueue(safeParse(getStorageKey('q'), []));
+    }
+
+    function getPlanData() {
+        const data = safeParse(getStorageKey('p'), []);
+        return Array.isArray(data) ? data.map(item => ({
+            v: normalizeVehicle(item.v),
+            l: String(item.l || '').toUpperCase().trim(),
+            c: parseInt(item.c, 10) || 0,
+            n: item.n || '',
+            e: item.e || '',
+            status: normalizeStatus(item.status)
+        })) : [];
+    }
+
+    function saveQueueData(data) {
+        return safeSetItem(getStorageKey('q'), compactQueue(data));
+    }
+
+    function savePlanData(data) {
+        return safeSetItem(getStorageKey('p'), data);
+    }
+
+    function scheduleDailyAutoSave() {
+        clearTimeout(autoSaveTimer);
+        autoSaveTimer = setTimeout(() => {
+            try {
+                localStorage.setItem('h_v3_last_date', getPlanDate());
+                localStorage.setItem('h_v3_last_saved', new Date().toISOString());
+            } catch (e) { /* ignore meta save errors */ }
+        }, 400);
+    }
+
+    function loadDailyData() {
+        getPlanDate();
+        syncQueueWithPlanning(true);
+        render();
+    }
+
+    function getAllPlannedVehicles(pData) {
+        return (pData || getPlanData()).map(item => normalizeVehicle(item.v)).filter(Boolean);
+    }
+
+    function isDuplicateInPlanning(vehicle, pData, excludeIdx) {
+        const v = normalizeVehicle(vehicle);
+        if (!v) return false;
+        return (pData || getPlanData()).some((item, i) => i !== excludeIdx && normalizeVehicle(item.v) === v);
+    }
+
+    function isDuplicateInQueue(vehicle, qData, excludeRowIdx, excludeCap) {
+        const v = normalizeVehicle(vehicle);
+        if (!v) return false;
+        const data = qData || getQueueData();
+        for (let ri = 0; ri < data.length; ri++) {
+            for (const cap of CAPS) {
+                if (excludeRowIdx === ri && excludeCap === cap) continue;
+                if (normalizeVehicle(data[ri][cap]) === v) return true;
+            }
+        }
+        return false;
+    }
+
+    function removeVehicleFromQueue(vehicle) {
+        const v = normalizeVehicle(vehicle);
+        if (!v) return;
+        let data = getQueueData();
+        let changed = false;
+        data.forEach(row => {
+            CAPS.forEach(cap => {
+                if (normalizeVehicle(row[cap]) === v) {
+                    row[cap] = '';
+                    changed = true;
+                }
+            });
+        });
+        if (changed) saveQueueData(data);
+    }
+
+    function syncQueueWithPlanning(silent) {
+        const pData = getPlanData();
+        const planned = new Set(getAllPlannedVehicles(pData));
+        if (!planned.size) return false;
+        let qData = getQueueData();
+        let changed = false;
+        qData.forEach(row => {
+            CAPS.forEach(cap => {
+                if (row[cap] && planned.has(normalizeVehicle(row[cap]))) {
+                    row[cap] = '';
+                    changed = true;
+                }
+            });
+        });
+        if (changed) {
+            saveQueueData(qData);
+            if (!silent) render();
+        }
+        return changed;
+    }
+
     // --- DRIVER MASTER ---
-    let editDriverIndex = -1;
     function openDriverPage() { document.getElementById('driverPage').style.display = 'flex'; renderDrivers(); }
     function closeDriverPage() { document.getElementById('driverPage').style.display = 'none'; editDriverIndex = -1; document.getElementById('mDrName').value = ""; document.getElementById('mDrPhone').value = ""; document.getElementById('driverSaveBtn').innerText = "સેવ ડ્રાઈવર"; }
     function saveDriver() {
         const name = document.getElementById('mDrName').value.trim();
         const phone = document.getElementById('mDrPhone').value.trim();
-        if(!name) return alert("નામ લખો");
-        let drivers = JSON.parse(localStorage.getItem('h_master_drivers')) || [];
-        if(editDriverIndex > -1) { drivers[editDriverIndex] = { name, phone }; editDriverIndex = -1; document.getElementById('driverSaveBtn').innerText = "સેવ ડ્રાઈવર"; }
-        else { drivers.push({ name, phone }); }
-        localStorage.setItem('h_master_drivers', JSON.stringify(drivers));
-        document.getElementById('mDrName').value = ""; document.getElementById('mDrPhone').value = ""; renderDrivers();
+        if (!name) return alert("નામ લખો");
+        let drivers = safeParse(MASTER_DRIVERS_KEY, []);
+        if (editDriverIndex > -1) {
+            drivers[editDriverIndex] = { name, phone };
+            editDriverIndex = -1;
+            document.getElementById('driverSaveBtn').innerText = "સેવ ડ્રાઈવર";
+        } else {
+            drivers.push({ name, phone });
+        }
+        safeSetItem(MASTER_DRIVERS_KEY, drivers);
+        document.getElementById('mDrName').value = "";
+        document.getElementById('mDrPhone').value = "";
+        renderDrivers();
     }
     function renderDrivers() {
-        let drivers = JSON.parse(localStorage.getItem('h_master_drivers')) || [];
-        document.getElementById('masterDriverList').innerHTML = drivers.map((d, i) => `<tr><td>${i+1}</td><td style="text-align:left; padding-left:20px;">${d.name}</td><td>${d.phone || '-'}</td><td><button class="btn-edit-small" onclick="editDriver(${i})">Edit</button><button class="btn-del" onclick="deleteDriver(${i})">×</button></td></tr>`).join('');
+        let drivers = safeParse(MASTER_DRIVERS_KEY, []);
+        document.getElementById('masterDriverList').innerHTML = drivers.map((d, i) => `<tr><td>${i + 1}</td><td style="text-align:left; padding-left:20px;">${d.name}</td><td>${d.phone || '-'}</td><td><button class="btn-edit-small" onclick="editDriver(${i})">Edit</button><button class="btn-del" onclick="deleteDriver(${i})">×</button></td></tr>`).join('');
     }
-    function editDriver(i) { let drivers = JSON.parse(localStorage.getItem('h_master_drivers')); document.getElementById('mDrName').value = drivers[i].name; document.getElementById('mDrPhone').value = drivers[i].phone; editDriverIndex = i; document.getElementById('driverSaveBtn').innerText = "અપડેટ કરો"; window.scrollTo(0,0); }
-    function deleteDriver(i) { if(confirm("આ ડ્રાઈવરને ડીલીટ કરવો છે?")) { let drivers = JSON.parse(localStorage.getItem('h_master_drivers')); drivers.splice(i, 1); localStorage.setItem('h_master_drivers', JSON.stringify(drivers)); renderDrivers(); } }
+    function editDriver(i) {
+        let drivers = safeParse(MASTER_DRIVERS_KEY, []);
+        if (!drivers[i]) return;
+        document.getElementById('mDrName').value = drivers[i].name;
+        document.getElementById('mDrPhone').value = drivers[i].phone || '';
+        editDriverIndex = i;
+        document.getElementById('driverSaveBtn').innerText = "અપડેટ કરો";
+        window.scrollTo(0, 0);
+    }
+    function deleteDriver(i) {
+        if (!confirm("આ ડ્રાઈવરને ડીલીટ કરવો છે?")) return;
+        let drivers = safeParse(MASTER_DRIVERS_KEY, []);
+        if (i < 0 || i >= drivers.length) return;
+        drivers.splice(i, 1);
+        safeSetItem(MASTER_DRIVERS_KEY, drivers);
+        renderDrivers();
+    }
+
+    function findDriverForVehicle(vehicle) {
+        const drivers = safeParse(MASTER_DRIVERS_KEY, []);
+        const vNorm = normalizeVehicle(vehicle);
+        const vCompact = vNorm.replace(/[^A-Z0-9]/g, '');
+        for (const d of drivers) {
+            const nameNorm = normalizeVehicle(d.name);
+            const nameCompact = nameNorm.replace(/[^A-Z0-9]/g, '');
+            if (!nameNorm) continue;
+            if (vNorm.includes(nameNorm) || nameNorm.includes(vNorm)) return d;
+            if (vCompact && nameCompact && (vCompact.includes(nameCompact) || nameCompact.includes(vCompact))) return d;
+            const nameWords = nameNorm.split(/\s+/).filter(w => w.length > 2);
+            const vehWords = vNorm.split(/\s+/);
+            if (nameWords.some(w => vehWords.some(vw => vw.includes(w) || w.includes(vw)))) return d;
+        }
+        return null;
+    }
+
+    function normalizePhone(phone) {
+        let p = String(phone || '').replace(/\D/g, '');
+        if (p.length === 10) p = '91' + p;
+        if (p.startsWith('0') && p.length === 11) p = '91' + p.slice(1);
+        return p;
+    }
 
     // --- CORE LOGIC ---
     function checkLogin() {
-        if(document.getElementById('userUID').value === 'admin' && document.getElementById('accessKey').value === 'hocco123') {
-            document.getElementById('loginOverlay').style.display = 'none'; document.getElementById('mainSystem').style.display = 'block';
-            render();
+        if (document.getElementById('userUID').value === 'admin' && document.getElementById('accessKey').value === 'hocco123') {
+            document.getElementById('loginOverlay').style.display = 'none';
+            document.getElementById('mainSystem').style.display = 'block';
             const dl = document.getElementById('distList');
-            distData.forEach(i => { const o = document.createElement('option'); o.value = `${i.d} (${i.c})`; dl.appendChild(o); });
-        } else { alert("ખોટો યુઝર આઈડી અથવા પાસવર્ડ!"); }
+            if (!dl.options.length) {
+                distData.forEach(i => { const o = document.createElement('option'); o.value = `${i.d} (${i.c})`; dl.appendChild(o); });
+            }
+            loadDailyData();
+        } else {
+            alert("ખોટો યુઝર આઈડી અથવા પાસવર્ડ!");
+        }
+    }
+
+    function extractRoutePart(part) {
+        part = String(part || '').trim().toUpperCase();
+        const paren = part.match(/\(([^)]+)\)/);
+        if (paren) return paren[1].trim();
+        return part;
+    }
+
+    function lookupKM(cityOrName) {
+        cityOrName = String(cityOrName || '').toUpperCase().trim();
+        if (!cityOrName) return null;
+
+        if (kmData[cityOrName] !== undefined) return kmData[cityOrName];
+
+        for (const [key, val] of Object.entries(kmData)) {
+            if (cityOrName === key || cityOrName.includes(key) || key.includes(cityOrName)) return val;
+        }
+
+        let found = distData.find(d => d.c.toUpperCase() === cityOrName);
+        if (found) return found.k;
+
+        found = distData.find(d => cityOrName.includes(d.c.toUpperCase()) || d.c.toUpperCase().includes(cityOrName));
+        if (found) return found.k;
+
+        found = distData.find(d => cityOrName.includes(d.d.toUpperCase()) || d.d.toUpperCase().includes(cityOrName));
+        if (found) return found.k;
+
+        return null;
     }
 
     function autoKM() {
         let rawInput = document.getElementById('pLoc').value.toUpperCase();
-        if(!rawInput) { document.getElementById('pNote').value = ""; return; }
-        let routes = rawInput.split('+'); let totalKM = 0; let foundAny = false;
+        if (!rawInput) { document.getElementById('pNote').value = ""; return; }
+
+        let routes = rawInput.split(/[+,&/|\\-]+/);
+        let totalKM = 0;
+        let foundAny = false;
+        const counted = new Set();
+
         routes.forEach(part => {
-            let item = part.trim();
-            if(kmData[item]) { totalKM += kmData[item]; foundAny = true; } 
-            else { let distFound = distData.find(d => item.includes(d.d) || d.d.includes(item)); if(distFound) { totalKM += distFound.k; foundAny = true; } }
+            const item = extractRoutePart(part);
+            if (!item || counted.has(item)) return;
+            const km = lookupKM(item);
+            if (km !== null) {
+                totalKM += km;
+                foundAny = true;
+                counted.add(item);
+            }
         });
+
         document.getElementById('pNote').value = foundAny ? totalKM + " KM (Total)" : "";
     }
 
     function addQueue() {
-        let v = document.getElementById('qVeh').value.toUpperCase().trim(); let c = document.getElementById('qCap').value; if(!v) return;
-        let key = getStorageKey('q'); let data = JSON.parse(localStorage.getItem(key)) || [];
-        let added = false; for(let row of data) { if(!row[c]) { row[c] = v; added = true; break; } }
-        if(!added) { let n = {"400":"","300":"","250":"","200":"","150":"","650":""}; n[c] = v; data.push(n); }
-        localStorage.setItem(key, JSON.stringify(data)); document.getElementById('qVeh').value = ""; render();
+        let v = normalizeVehicle(document.getElementById('qVeh').value);
+        let c = document.getElementById('qCap').value;
+        if (!v) return;
+
+        const pData = getPlanData();
+        if (isDuplicateInPlanning(v, pData)) {
+            alert(`ગાડી ${v} પહેલેથી પ્લાનિંગમાં છે.`);
+            return;
+        }
+
+        let data = getQueueData();
+        if (isDuplicateInQueue(v, data)) {
+            alert(`ગાડી ${v} પહેલેથી Queue માં છે.`);
+            return;
+        }
+
+        let added = false;
+        for (let row of data) {
+            if (!row[c]) { row[c] = v; added = true; break; }
+        }
+        if (!added) {
+            let n = emptyQueueRow();
+            n[c] = v;
+            data.push(n);
+        }
+
+        if (saveQueueData(data)) {
+            document.getElementById('qVeh').value = "";
+            render();
+        }
     }
 
     function editQueue(rowIdx, cap) {
-        let key = getStorageKey('q'); let data = JSON.parse(localStorage.getItem(key));
+        let data = getQueueData();
+        if (!data[rowIdx] || !data[rowIdx][cap]) return;
+
         let newVal = prompt("નવો ગાડી નંબર દાખલ કરો:", data[rowIdx][cap]);
-        if (newVal !== null) { data[rowIdx][cap] = newVal.toUpperCase().trim(); localStorage.setItem(key, JSON.stringify(data)); render(); }
+        if (newVal === null) return;
+
+        newVal = normalizeVehicle(newVal);
+        if (!newVal) {
+            data[rowIdx][cap] = '';
+            saveQueueData(data);
+            render();
+            return;
+        }
+
+        if (isDuplicateInPlanning(newVal, getPlanData())) {
+            alert(`ગાડી ${newVal} પહેલેથી પ્લાનિંગમાં છે.`);
+            return;
+        }
+        if (isDuplicateInQueue(newVal, data, rowIdx, cap)) {
+            alert(`ગાડી ${newVal} પહેલેથી Queue માં છે.`);
+            return;
+        }
+
+        data[rowIdx][cap] = newVal;
+        saveQueueData(data);
+        render();
     }
 
     function toggleStatus(idx) {
-        let key = getStorageKey('p'); let data = JSON.parse(localStorage.getItem(key));
-        const states = ['Waiting', 'Under Process', 'Loaded'];
-        let currentIdx = states.indexOf(data[idx].status || 'Waiting');
-        data[idx].status = states[(currentIdx + 1) % 3];
-        localStorage.setItem(key, JSON.stringify(data)); render();
+        let data = getPlanData();
+        if (idx < 0 || idx >= data.length) return;
+        let currentIdx = STATUS_STATES.indexOf(normalizeStatus(data[idx].status));
+        if (currentIdx < 0) currentIdx = 0;
+        data[idx].status = STATUS_STATES[(currentIdx + 1) % STATUS_STATES.length];
+        savePlanData(data);
+        render();
     }
 
     function addPlan() {
-        let v = document.getElementById('pVeh').value.toUpperCase().trim(); let l = document.getElementById('pLoc').value.toUpperCase().trim();
-        let c = parseInt(document.getElementById('pCrates').value) || 0;
-        if(!v || !l) return;
-        let key = getStorageKey('p'); let data = JSON.parse(localStorage.getItem(key)) || [];
-        data.push({ v, l, c, n: document.getElementById('pNote').value, e: document.getElementById('pExtra').value, status: 'Waiting' });
-        localStorage.setItem(key, JSON.stringify(data));
-        ["pVeh","pLoc","pCrates","pNote","pExtra"].forEach(id => document.getElementById(id).value = ""); render();
+        let v = normalizeVehicle(document.getElementById('pVeh').value);
+        let l = document.getElementById('pLoc').value.toUpperCase().trim();
+        let c = parseInt(document.getElementById('pCrates').value, 10) || 0;
+        if (!v || !l) return;
+
+        autoKM();
+
+        let data = getPlanData();
+        if (isDuplicateInPlanning(v, data)) {
+            alert(`ગાડી ${v} પહેલેથી પ્લાનિંગમાં છે.`);
+            return;
+        }
+
+        data.push({
+            v, l, c,
+            n: document.getElementById('pNote').value,
+            e: document.getElementById('pExtra').value,
+            status: 'Waiting'
+        });
+
+        if (savePlanData(data)) {
+            removeVehicleFromQueue(v);
+            syncQueueWithPlanning(true);
+            ["pVeh", "pLoc", "pCrates", "pNote", "pExtra"].forEach(id => document.getElementById(id).value = "");
+            render();
+        }
     }
 
-    // --- NEW INDIVIDUAL WHATSAPP SHARE ---
     function shareDriverWA(idx) {
-        let pData = JSON.parse(localStorage.getItem(getStorageKey('p'))) || [];
+        let pData = getPlanData();
+        if (idx < 0 || idx >= pData.length) return;
         let item = pData[idx];
-        let date = document.getElementById('planDate').value;
-        
+        let date = getPlanDate();
+
         let msg = `*HOCCO BAVLA - DISPATCH PLAN*\n`;
         msg += `----------------------------\n`;
         msg += `📅 Date: *${date}*\n`;
@@ -391,40 +721,47 @@
         msg += `📍 Route: *${item.l}*\n`;
         msg += `📦 Crates: *${item.c}*\n`;
         msg += `🛣️ KM: *${item.n}*\n`;
-        if(item.e) msg += `📝 Remark: ${item.e}\n`;
+        if (item.e) msg += `📝 Remark: ${item.e}\n`;
         msg += `----------------------------\n`;
         msg += `તમારું પ્લાનિંગ કન્ફર્મ થઈ ગયું છે.`;
 
-        // Check if driver exists in Master to get phone
-        let drivers = JSON.parse(localStorage.getItem('h_master_drivers')) || [];
-        let drFound = drivers.find(d => item.v.includes(d.name) || d.name.includes(item.v)); // Basic match
-        
+        let drFound = findDriverForVehicle(item.v);
         let phone = "";
-        if(drFound && drFound.phone) {
-            phone = drFound.phone;
+
+        if (drFound && drFound.phone) {
+            phone = normalizePhone(drFound.phone);
         } else {
             phone = prompt("ડ્રાઈવરનો મોબાઈલ નંબર નાખો (91 સાથે):", "91");
+            if (phone) phone = normalizePhone(phone);
         }
 
-        if(phone) {
+        if (phone) {
             window.open(`https://wa.me/${phone}?text=${encodeURIComponent(msg)}`);
         }
     }
 
     function render() {
-        const dVal = document.getElementById('planDate').value; document.getElementById('displayDate').innerText = "DATE: " + dVal;
-        let pData = JSON.parse(localStorage.getItem(getStorageKey('p'))) || [];
-        let qData = JSON.parse(localStorage.getItem(getStorageKey('q'))) || [];
-        let plannedVehicles = pData.map(item => item.v);
+        getPlanDate();
+        syncQueueWithPlanning(true);
 
-        let pBody = document.getElementById('planBody'); pBody.innerHTML = "";
+        const dVal = getPlanDate();
+        document.getElementById('displayDate').innerText = "DATE: " + dVal;
+
+        let pData = getPlanData();
+        let qData = getQueueData();
+        let plannedSet = new Set(getAllPlannedVehicles(pData));
+
+        let pBody = document.getElementById('planBody');
+        pBody.innerHTML = "";
         let totC = 0;
+
         pData.forEach((item, idx) => {
-            totC += item.c; let s = item.status || 'Waiting';
+            totC += item.c;
+            let s = normalizeStatus(item.status);
             let rCls = s === 'Loaded' ? 'row-loaded' : (s === 'Under Process' ? 'row-under-process' : '');
             let bCls = s === 'Loaded' ? 'status-done' : (s === 'Under Process' ? 'status-process' : 'status-waiting');
             pBody.innerHTML += `<tr class="${rCls}">
-                <td>${idx+1}</td>
+                <td>${idx + 1}</td>
                 <td class="no-print"><button class="btn-status ${bCls}" onclick="toggleStatus(${idx})">${s}</button></td>
                 <td style="color:var(--primary); font-weight:800;">${item.v}</td>
                 <td>${item.l}</td>
@@ -438,40 +775,65 @@
             </tr>`;
         });
 
-        let qBody = document.getElementById('queueBody'); qBody.innerHTML = ""; let pending = 0;
+        let qBody = document.getElementById('queueBody');
+        qBody.innerHTML = "";
+        let pending = 0;
+
         qData.forEach((row, idx) => {
-            let h = `<tr><td>${idx+1}</td>`;
-            ["400","300","250","200","150","650"].forEach(cap => {
-                let v = row[cap] || "-"; let highlight = (v !== "-" && plannedVehicles.includes(v)) ? "row-highlight" : "";
-                if(v !== "-" && !plannedVehicles.includes(v)) pending++;
+            let h = `<tr><td>${idx + 1}</td>`;
+            CAPS.forEach(cap => {
+                let v = row[cap] || "-";
+                let vNorm = v !== "-" ? normalizeVehicle(v) : "";
+                let highlight = (vNorm && plannedSet.has(vNorm)) ? "row-highlight" : "";
+                if (vNorm && !plannedSet.has(vNorm)) pending++;
                 h += `<td class="${highlight} ${v !== '-' ? 'editable-cell' : ''}" onclick="${v !== '-' ? `editQueue(${idx}, '${cap}')` : ''}">${v}</td>`;
             });
             qBody.innerHTML += h + `<td class="no-print"><button class="btn-del" onclick="deleteQueue(${idx})">×</button></td></tr>`;
         });
+
         document.getElementById('statVehicles').innerText = pData.length;
         document.getElementById('statCrates').innerText = totC;
         document.getElementById('statPending').innerText = pending;
     }
 
-    function getStorageKey(type) { return `h_v3_${type}_${document.getElementById('planDate').value}`; }
-    document.getElementById('planDate').valueAsDate = new Date();
-    function deletePlan(i) { let d = JSON.parse(localStorage.getItem(getStorageKey('p'))); d.splice(i,1); localStorage.setItem(getStorageKey('p'), JSON.stringify(d)); render(); }
-    function deleteQueue(i) { let d = JSON.parse(localStorage.getItem(getStorageKey('q'))); d.splice(i,1); localStorage.setItem(getStorageKey('q'), JSON.stringify(d)); render(); }
-    function clearAll() { if(confirm("શું બધો ડેટા સાફ કરવો છે?")) { localStorage.clear(); render(); } }
+    function deletePlan(i) {
+        let d = getPlanData();
+        if (i < 0 || i >= d.length) return;
+        d.splice(i, 1);
+        savePlanData(d);
+        render();
+    }
+
+    function deleteQueue(i) {
+        let d = getQueueData();
+        if (i < 0 || i >= d.length) return;
+        d.splice(i, 1);
+        saveQueueData(d);
+        render();
+    }
+
+    function clearAll() {
+        if (!confirm("શું આ તારીખનો બધો ડેટા સાફ કરવો છે? (Driver Master સાચવાશે)")) return;
+        localStorage.removeItem(getStorageKey('p'));
+        localStorage.removeItem(getStorageKey('q'));
+        render();
+    }
 
     function shareWhatsapp() {
-        let pData = JSON.parse(localStorage.getItem(getStorageKey('p'))) || [];
-        let txt = `*HOCCO BAVLA REPORT - ${document.getElementById('planDate').value}*\n\n`;
-        pData.forEach((item, i) => { txt += `${i+1}. *${item.v}* | ${item.l} | ${item.c} Cr | ${item.status}\n`; });
+        let pData = getPlanData();
+        let txt = `*HOCCO BAVLA REPORT - ${getPlanDate()}*\n\n`;
+        pData.forEach((item, i) => {
+            txt += `${i + 1}. *${item.v}* | ${item.l} | ${item.c} Cr | ${normalizeStatus(item.status)}\n`;
+        });
         window.open(`https://wa.me/?text=${encodeURIComponent(txt)}`);
     }
 
     function exportToExcel() {
-        let pData = JSON.parse(localStorage.getItem(getStorageKey('p'))) || [];
-        if(pData.length === 0) return alert("નિકાસ કરવા માટે કોઈ ડેટા નથી!");
+        let pData = getPlanData();
+        if (pData.length === 0) return alert("નિકાસ કરવા માટે કોઈ ડેટા નથી!");
         const worksheetData = pData.map((item, index) => ({
             "No": index + 1,
-            "Status": item.status,
+            "Status": normalizeStatus(item.status),
             "Vehicle No": item.v,
             "Route": item.l,
             "Crates": item.c,
@@ -481,9 +843,18 @@
         const worksheet = XLSX.utils.json_to_sheet(worksheetData);
         const workbook = XLSX.utils.book_new();
         XLSX.utils.book_append_sheet(workbook, worksheet, "Dispatch Report");
-        const fileName = `Hocco_Dispatch_${document.getElementById('planDate').value}.xlsx`;
+        const fileName = `Hocco_Dispatch_${getPlanDate()}.xlsx`;
         XLSX.writeFile(workbook, fileName);
     }
+
+    // --- INIT: daily auto-load by date ---
+    document.getElementById('planDate').valueAsDate = new Date();
+    document.getElementById('planDate').addEventListener('change', loadDailyData);
+    window.addEventListener('beforeunload', () => {
+        try {
+            localStorage.setItem('h_v3_last_date', getPlanDate());
+        } catch (e) { /* ignore */ }
+    });
 </script>
 <script defer src="https://static.cloudflareinsights.com/beacon.min.js/v4513226cdae34746b4dedf0b4dfa099e1781791509496" integrity="sha512-ZE9pZaUXND66v380QUtch/5sE9tPFh2zg45pR2PB0CVkCtOREv2AJKkSidISWkysEuQ0EH8faUU5du78bx87UQ==" data-cf-beacon='{"version":"2024.11.0","token":"e3c1c9af36de41759418005494a48906","r":1,"server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
 </body>
